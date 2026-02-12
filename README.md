@@ -531,11 +531,13 @@ This code builds upon following open-source code-bases. Please visit the URLs to
 9. https://github.com/unitreerobotics/unitree_sdk2_python
 10. https://github.com/ARCLab-MIT/beavr-bot
 
-## 7. 📝 Citation
+# 7. 📝 Citation
 
+```
 @misc{xr-teleoperate,
   author       = {Unitree},
   title        = {XR-Teleoperate: An Open-Source Teleoperation Framework and Data Collection Toolkit for Embodied Intelligence},
   howpublished = {\url{https://github.com/unitreerobotics/xr_teleoperate}},
   year         = {2025},
 }
+```
