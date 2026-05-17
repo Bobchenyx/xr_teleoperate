@@ -58,9 +58,20 @@ python teleop_hand_and_arm.py --ee=dex3 --motion
 
 # Controller tracking instead of hand tracking
 python teleop_hand_and_arm.py --input-mode=controller --ee=dex1
+
+# Pass-through display (see surroundings via XR device cameras, not robot's head camera)
+python teleop_hand_and_arm.py --ee=dex3 --display-mode=pass-through
+
+# Specify image server (PC2) IP and DDS network interface
+python teleop_hand_and_arm.py --ee=dex3 --img-server-ip=192.168.123.164 --network-interface=eth0
 ```
 
 Runtime keyboard controls: **r** = start tracking, **s** = toggle recording, **q** = quit.
+
+Other flags worth knowing:
+- `--display-mode` ∈ {`immersive` (default), `ego`, `pass-through`} — `pass-through` was added in v1.4 for viewing the room through VR cameras while teleoperating.
+- `--img-server-ip` — IP of the PC2 image server (default `192.168.123.164`).
+- `--network-interface` — CycloneDDS interface name (e.g. `eth0`, `wlan0`). Added in v1.5.
 
 ## Architecture
 
@@ -85,13 +96,15 @@ teleop_hand_and_arm.py      ──  main loop: orchestrates all subsystems at --
 
 - **`teleop/teleop_hand_and_arm.py`** — Single entry point. State machine (START/STOP/READY/RECORD_RUNNING) driven by keyboard or IPC. All robot types and end-effectors are handled here via CLI args. Main loop: waits for `r` key in pre-start loop, then runs at `1/--frequency` Hz reading images, solving IK, commanding arms, and optionally recording.
 
-- **`teleop/robot_control/robot_arm_ik.py`** — IK solvers per robot variant (`G1_29_ArmIK`, `G1_23_ArmIK`, `H1_2_ArmIK`, `H1_ArmIK`). Uses Pinocchio for kinematics and CasADi for nonlinear optimization. Loads URDF from `assets/`, caches compiled models as `.pkl` files in the current working directory for faster startup.
+- **`teleop/robot_control/robot_arm_ik.py`** — IK solvers per robot variant (`G1_29_ArmIK`, `G1_23_ArmIK`, `H1_2_ArmIK`, `H1_ArmIK`). Uses Pinocchio for kinematics and CasADi for nonlinear optimization. Loads URDF from `assets/`, then caches the compiled Pinocchio model as a `.pkl` file in the current working directory (v1.5 URDF-caching speed-up). First run is slow; subsequent runs reuse the cache. Because the path is relative to CWD, the cache only hits when the script is launched from `teleop/`.
 
 - **`teleop/robot_control/robot_arm.py`** — Arm controllers per robot variant. Publishes low-level motor commands via DDS topics (`rt/lowcmd` for debug, `rt/arm_sdk` for motion mode). Subscribes to `rt/lowstate` for current joint state. Handles smooth startup ramp and go-home on exit.
 
 - **`teleop/robot_control/robot_hand_*.py`** — End-effector controllers (Dex3-1, Dex1-1, Inspire DFX/FTP, BrainCo). Each runs as a **separate process** via `multiprocessing`, communicating with the main loop through shared `Array`/`Value` objects.
 
 - **`teleop/robot_control/hand_retargeting.py`** — Wraps the `dex-retargeting` submodule to map XR hand joint positions to robot hand joint angles.
+
+- **`teleop/utils/motion_switcher.py`** — `MotionSwitcher` and `LocoClientWrapper`. Wraps `unitree_sdk2py`'s motion-switcher and loco clients so the script can enter/exit the robot's debug mode automatically at startup/shutdown instead of requiring the physical remote controller. Added in v1.4.
 
 ### End-Effector / Input Mode Compatibility
 
@@ -146,7 +159,7 @@ logger_mp = logging_mp.getLogger(__name__)
 
 ## Conventions
 
-- The main script must be run from `teleop/` because URDF paths in IK classes are relative (e.g., `../assets/g1/...`) and `.pkl` cache files are written to the current directory.
+- The main script must be run from `teleop/` because URDF paths in IK classes are relative (e.g., `../assets/g1/...`) and `.pkl` cache files are written to (and looked up from) the current directory — see `robot_arm_ik.py` above.
 - Hand controllers use `multiprocessing` with shared memory (`Array`, `Value`, `Lock`) — not threads.
 - IK solver results are filtered through `WeightedMovingFilter` for smooth joint trajectories.
 - Recorded data goes to `teleop/utils/data/` by default (gitignored).
