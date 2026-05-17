@@ -66,7 +66,7 @@ python teleop_hand_and_arm.py --ee=dex3 --display-mode=pass-through
 python teleop_hand_and_arm.py --ee=dex3 --img-server-ip=192.168.123.164 --network-interface=eth0
 ```
 
-Runtime keyboard controls: **r** = start tracking, **s** = toggle recording, **q** = quit.
+Runtime keyboard controls: **r** = start tracking (or resume from pause), **p** = pause / resume toggle (arms ease to `np.zeros(14)` at `PAUSE_HOME_VELOCITY` rad/s; arm_sdk authority is retained so the high-level motion controller does NOT take over in `--motion` mode; XR view keeps rendering), **s** = toggle recording, **q** = quit.
 
 Other flags worth knowing:
 - `--display-mode` ∈ {`immersive` (default), `ego`, `pass-through`} — `pass-through` was added in v1.4 for viewing the room through VR cameras while teleoperating.
@@ -130,7 +130,7 @@ Three submodules in `teleop/`:
 - **Robot ↔ Host**: CycloneDDS via `unitree_sdk2py`. Domain ID 0 for physical robot, 1 for simulation.
 - **XR Device ↔ Host**: WebSocket/WebRTC over HTTPS (requires SSL certs in `televuer/` or `~/.config/xr_teleoperate/`).
 - **Image Server (PC2) ↔ Host**: ZMQ for image frames, WebRTC for direct streaming to XR device. Camera config via `cam_config_server.yaml` in teleimager.
-- **IPC mode** (`--ipc`): ZMQ REP/REQ on Linux abstract sockets (`ipc://@xr_teleoperate_data.ipc` for commands, `ipc://@xr_teleoperate_hb.ipc` for heartbeat). Same-host only. Commands: `CMD_START`, `CMD_STOP`, `CMD_RECORD_TOGGLE`. Run `python teleop/utils/ipc.py` for a client example.
+- **IPC mode** (`--ipc`): ZMQ REP/REQ on Linux abstract sockets (`ipc://@xr_teleoperate_data.ipc` for commands, `ipc://@xr_teleoperate_hb.ipc` for heartbeat). Same-host only. Commands: `CMD_START` (also resumes from pause), `CMD_STOP`, `CMD_RECORD_TOGGLE`, `CMD_PAUSE_TOGGLE`. Heartbeat includes a `PAUSED` flag. Run `python teleop/utils/ipc.py` for a client example.
 
 ### Recording Format
 

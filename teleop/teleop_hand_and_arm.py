@@ -1,5 +1,6 @@
 import time
 import argparse
+import numpy as np
 from multiprocessing import Value, Array, Lock
 import threading
 import logging_mp
@@ -36,6 +37,13 @@ STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
+PAUSED         = False  # True while teleop is paused: arms parked at np.zeros(14), XR view still rendered, IK/arm-cmd skipped
+PAUSE_SETTLING = False  # True while ctrl_dual_arm_go_home is running on the pause edge; blocks 'r'-resume to prevent rapid p→r racing the home motion
+
+# Velocity cap (rad/s) used while homing arms during pause. Active teleop runs
+# at ~30 rad/s, which homes too abruptly when the operator is mid-motion. Lower
+# this for a more visible, controlled return; raise it if the homing feels sluggish.
+PAUSE_HOME_VELOCITY = 5.0
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -49,25 +57,48 @@ RECORD_TOGGLE  = False  # Toggle recording state
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE
+    global STOP, START, RECORD_TOGGLE, PAUSED
     if key == 'r':
-        START = True
+        if not START:
+            START = True
+        elif PAUSED and not PAUSE_SETTLING:
+            PAUSED = False
+            logger_mp.info("▶️  Resume requested — arms will re-ramp velocity and follow your motion.")
+        elif PAUSED and PAUSE_SETTLING:
+            logger_mp.warning("⏸️  Cannot resume yet — arms are still moving to home. Try again in a moment.")
+    elif key == 'p':
+        if START and not PAUSED:
+            PAUSED = True
+        elif PAUSED and not PAUSE_SETTLING:
+            # [p] toggles — pressing again after homing settles also resumes.
+            PAUSED = False
+            logger_mp.info("▶️  Resume requested via [p] toggle — arms will re-ramp velocity and follow your motion.")
+        elif PAUSED and PAUSE_SETTLING:
+            logger_mp.warning("⏸️  Cannot resume yet — arms are still moving to home. Try again in a moment.")
+        else:
+            logger_mp.info("⏸️  Press [r] to start teleop first; [p] only works while running.")
     elif key == 'q':
         START = False
         STOP = True
-    elif key == 's' and START == True:
-        RECORD_TOGGLE = True
+    elif key == 's':
+        if START and not PAUSED:
+            RECORD_TOGGLE = True
+        elif PAUSED:
+            logger_mp.info("🟡 Recording toggle ignored while paused. Press [r] to resume first.")
+        else:
+            logger_mp.info("🟡 Press [r] to start teleop before toggling recording.")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
 def get_state() -> dict:
     """Return current heartbeat state"""
-    global START, STOP, RECORD_RUNNING, READY
+    global START, STOP, RECORD_RUNNING, READY, PAUSED
     return {
         "START": START,
         "STOP": STOP,
         "READY": READY,
         "RECORD_RUNNING": RECORD_RUNNING,
+        "PAUSED": PAUSED,
     }
 
 if __name__ == '__main__':
@@ -244,6 +275,7 @@ if __name__ == '__main__':
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+        logger_mp.info("⏸️   Press [p] to pause (arms return home); press [r] again to resume.")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
         else:
@@ -263,10 +295,85 @@ if __name__ == '__main__':
         head_img = None
         left_wrist_img = None
         right_wrist_img = None
-
+        was_paused = False  # edge detector for PAUSED transitions
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
+
+            # pause / resume handling
+            if PAUSED:
+                if not was_paused:
+                    # entering pause: stop recording (auto-save) and park arms at np.zeros(14)
+                    if args.record and RECORD_RUNNING:
+                        RECORD_RUNNING = False
+                        recorder.save_episode()
+                        if args.sim:
+                            publish_reset_category(1, reset_pose_publisher)
+                    # Clear any pending record-toggle so a queued [s] press doesn't
+                    # accidentally start a new episode the moment we resume.
+                    RECORD_TOGGLE = False
+                    if args.sim:
+                        logger_mp.info("⏸️  Pausing — sending arms to home position (q=0, tau=0). [sim mode: velocity limit ignored, motion is instantaneous]")
+                    else:
+                        logger_mp.info(f"⏸️  Pausing — sending arms to home position (q=0, tau=0) at {PAUSE_HOME_VELOCITY} rad/s.")
+                    PAUSE_SETTLING = True
+                    try:
+                        # Slow the homing motion. The publisher thread normally ramps
+                        # arm_velocity_limit to 30 rad/s; we need to (1) stop that ramp
+                        # from continuing to overwrite the limit, then (2) set our own
+                        # slower limit. Touches private _speed_gradual_max — see
+                        # robot_arm.py:189-191. The resume path below calls
+                        # speed_gradual_max() which restarts the standard 20→30 ramp.
+                        arm_ctrl._speed_gradual_max = False
+                        arm_ctrl.arm_velocity_limit = PAUSE_HOME_VELOCITY
+                        # Zero both q_target AND tauff_target (upstream go_home only
+                        # zeros q; the tauff line is commented out — so stale
+                        # IK gravity-comp torques would otherwise keep streaming).
+                        # Lock-less read of q_target/tauff_target is safe: ctrl_dual_arm
+                        # only ever rebinds those attributes (never mutates in place),
+                        # so np.zeros_like sees a fully-formed ndarray.
+                        arm_ctrl.ctrl_dual_arm(np.zeros_like(arm_ctrl.q_target),
+                                               np.zeros_like(arm_ctrl.tauff_target))
+                        # NOTE: do NOT call ctrl_dual_arm_go_home() here. In motion
+                        # mode it ends with an arm_sdk authority ramp (1→0) that hands
+                        # the arms back to the high-level motion controller — correct
+                        # on shutdown, wrong on pause (we want arm_sdk to keep holding
+                        # arms at zero). The shutdown finally: below still uses go_home
+                        # because there we DO want that handoff. So roll our own
+                        # poll-until-close loop, matching go_home's tolerance/timing
+                        # but without touching authority.
+                        tolerance = 0.05
+                        max_attempts = 100  # ~5 s at 0.05 s/attempt, same budget as go_home
+                        for _ in range(max_attempts):
+                            if STOP:  # honor [q] mid-homing; shutdown finally: will re-home properly
+                                break
+                            current_q = arm_ctrl.get_current_dual_arm_q()
+                            if np.all(np.abs(current_q) < tolerance):
+                                logger_mp.info("[pause] arms reached home; arm_sdk authority retained.")
+                                break
+                            time.sleep(0.05)
+                        else:
+                            logger_mp.warning("[pause] arms did not reach tolerance within timeout. Arms may not be exactly at zero.")
+                    except Exception as e:
+                        logger_mp.warning(f"pause home-settling did not complete: {e}. Arms may not be exactly at zero.")
+                    finally:
+                        PAUSE_SETTLING = False
+                    logger_mp.info("⏸️  Paused. Press [r] to resume, [q] to exit.")
+                    was_paused = True
+                # while paused: keep XR view alive but skip IK / arm command / recording
+                if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+                    head_img = img_client.get_head_frame()
+                    tv_wrapper.render_to_xr(head_img)
+                time_elapsed = time.time() - start_time
+                time.sleep(max(0, (1 / args.frequency) - time_elapsed))
+                continue
+
+            if was_paused:
+                # resuming: re-arm the velocity ramp so motion eases back in safely
+                logger_mp.info("▶️  Resuming — re-ramping arm velocity.")
+                arm_ctrl.speed_gradual_max()
+                was_paused = False
+
             # get image
             if camera_config['head_camera']['enable_zmq']:
                 if args.record or xr_need_local_img:
@@ -493,6 +600,10 @@ if __name__ == '__main__':
         logger_mp.error(traceback.format_exc())
     finally:
         try:
+            # See pause-edge handler above for why we zero tauff explicitly
+            # before go_home — upstream go_home only zeros q_target.
+            arm_ctrl.ctrl_dual_arm(np.zeros_like(arm_ctrl.q_target),
+                                   np.zeros_like(arm_ctrl.tauff_target))
             arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")

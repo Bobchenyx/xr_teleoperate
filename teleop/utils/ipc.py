@@ -25,6 +25,12 @@ logger_mp = logging_mp.getLogger(__name__)
         "cmd": "CMD_RECORD_TOGGLE"
     }
 
+4) pause (arms home) or resume teleop
+    {
+        "reqid": unique id,
+        "cmd": "CMD_PAUSE_TOGGLE"
+    }
+
 # Server → Client (Reply)
 1) if ok
     {
@@ -36,9 +42,9 @@ logger_mp = logging_mp.getLogger(__name__)
     {
         "repid": same as reqid | 0 | 1,   # 0: no reqid provided, 1: internal error
         "status": "error",
-        "msg": "reqid not provided" 
-             | "cmd not provided" 
-             | "cmd not supported: {cmd}" 
+        "msg": "reqid not provided"
+             | "cmd not provided"
+             | "cmd not supported: {cmd}"
              | "internal error msg"
     }
 
@@ -47,8 +53,9 @@ logger_mp = logging_mp.getLogger(__name__)
     {
         "START": True | False,          # whether robot follow vr
         "STOP" : True | False,          # whether exit program
+        "READY": True | False,          # whether ready to (1) START or (2) toggle recording
         "RECORD_RUNNING": True | False, # whether is recording
-        "RECORD_READY": True | False,   # whether ready to record
+        "PAUSED": True | False,         # whether teleop is paused (arms parked at home). Implies arm tracking is suspended even if START is True.
     }
 """
 
@@ -61,9 +68,10 @@ class IPC_Server:
     """
     # Mapping table for on_press keys
     cmd_map = {
-        "CMD_START": "r",          # launch
+        "CMD_START": "r",          # launch (also resume from pause)
         "CMD_STOP": "q",           # exit
         "CMD_RECORD_TOGGLE": "s",  # start & stop (toggle record)
+        "CMD_PAUSE_TOGGLE": "p",   # pause teleop (arms go home); resume via CMD_START
     }
 
     def __init__(self, on_press=None, get_state=None, hb_fps=10.0):
@@ -336,7 +344,11 @@ if __name__ == "__main__":
             logger_mp.info("⏺️ Sending record toggle command...")
             rep = client.send_data("CMD_RECORD_TOGGLE")
             logger_mp.info("Reply: %s", rep)
-            
+
+        elif key == "p":
+            logger_mp.info("⏸️ Sending pause toggle command...")
+            rep = client.send_data("CMD_PAUSE_TOGGLE")
+            logger_mp.info("Reply: %s", rep)
 
         elif key == "q":
             logger_mp.info("⏹️ Sending exit command...")
@@ -360,7 +372,7 @@ if __name__ == "__main__":
     listen_keyboard_thread = threading.Thread(target=listen_keyboard, kwargs={"on_press": on_press, "until": None, "sequential": False}, daemon=True)
     listen_keyboard_thread.start()
 
-    logger_mp.info("✅ Client started, waiting for keyboard input:\n [r] launch, [s] start/stop record, [b] heartbeat, [q] exit")
+    logger_mp.info("✅ Client started, waiting for keyboard input:\n [r] launch/resume, [p] pause, [s] start/stop record, [b] heartbeat, [q] exit")
     try:
         while True:
             time.sleep(1.0)
